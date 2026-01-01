@@ -1,0 +1,1124 @@
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <map>
+#include <set>
+#include <regex>
+#include <algorithm>
+#include <memory>
+#include <iomanip>
+#include <cmath>
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+struct InscriptionRecord {
+    std::string id;
+    std::string inscription_text;
+    std::string clean_text_conservative;
+    std::string clean_text_interpretive;
+    std::string not_after;
+    std::string not_before;
+    std::string findspot;
+    std::string province;
+    std::string material;
+    std::string type_of_inscription;
+    std::string language;
+    std::string height;
+    std::string width;
+    std::string depth;
+    std::string latitude;
+    std::string longitude;
+    std::string commentary;
+    std::string bibliography;
+};
+
+struct Person {
+    std::string name;
+    std::string praenomen;
+    std::string nomen;
+    std::string cognomen;
+    int age;
+    std::string ageUnit;
+    std::string familyRole;
+    std::string gender;
+    std::string status;
+    std::string tribe;
+    std::string inscriptionId;
+    std::vector<std::string> rawTokens;
+    
+    Person() : age(-1) {}
+    
+    void print() const {
+        if (!name.empty()) std::cout << "Name: " << name << "\n";
+        if (!praenomen.empty()) std::cout << "  Praenomen: " << praenomen << "\n";
+        if (!nomen.empty()) std::cout << "  Nomen: " << nomen << "\n";
+        if (!cognomen.empty()) std::cout << "  Cognomen: " << cognomen << "\n";
+        if (age != -1) std::cout << "Age: " << age << " " << ageUnit << "\n";
+        if (!familyRole.empty()) std::cout << "Family Role: " << familyRole << "\n";
+        if (!gender.empty()) {
+            std::string genderStr = gender == "M" ? "Male" : 
+                                   gender == "F" ? "Female" : "Unknown";
+            std::cout << "Gender: " << genderStr << "\n";
+        }
+        if (!status.empty()) std::cout << "Status: " << status << "\n";
+        if (!tribe.empty()) std::cout << "Tribe: " << tribe << "\n";
+        if (!inscriptionId.empty()) std::cout << "Inscription ID: " << inscriptionId << "\n";
+        std::cout << "---\n";
+    }
+    
+    std::string toCSV() const {
+        std::stringstream ss;
+        ss << "\"" << inscriptionId << "\","
+           << "\"" << name << "\","
+           << "\"" << praenomen << "\","
+           << "\"" << nomen << "\","
+           << "\"" << cognomen << "\","
+           << age << ","
+           << "\"" << ageUnit << "\","
+           << "\"" << familyRole << "\","
+           << "\"" << gender << "\","
+           << "\"" << status << "\","
+           << "\"" << tribe << "\"";
+        return ss.str();
+    }
+};
+
+struct FamilyNetwork {
+    std::map<std::string, std::vector<std::string>> relationships;
+    
+    void addRelationship(const std::string& person1, const std::string& person2, 
+                        const std::string& relationship) {
+        relationships[person1].push_back(person2 + " (" + relationship + ")");
+    }
+    
+    void print() const {
+        std::cout << "\n=== FAMILY NETWORK ANALYSIS ===\n";
+        for (const auto& pair : relationships) {
+            std::cout << pair.first << " connected to:\n";
+            for (const auto& rel : pair.second) {
+                std::cout << "  - " << rel << "\n";
+            }
+        }
+    }
+    
+    void exportToDOT(const std::string& filename) const {
+        std::ofstream file(filename);
+        if (!file.is_open()) return;
+        
+        file << "digraph FamilyNetwork {\n";
+        file << "  rankdir=LR;\n";
+        file << "  node [shape=box, style=rounded];\n\n";
+        
+        for (const auto& pair : relationships) {
+            for (const auto& rel : pair.second) {
+                size_t pos = rel.find(" (");
+                if (pos != std::string::npos) {
+                    std::string person2 = rel.substr(0, pos);
+                    std::string relationship = rel.substr(pos + 2);
+                    relationship.pop_back();
+                    
+                    file << "  \"" << pair.first << "\" -> \"" << person2 
+                         << "\" [label=\"" << relationship << "\"];\n";
+                }
+            }
+        }
+        
+        file << "}\n";
+        file.close();
+        std::cout << "Network exported to " << filename << "\n";
+        std::cout << "View with: dot -Tpng " << filename << " -o network.png\n";
+    }
+};
+
+// ============================================================================
+// CSV PARSER
+// ============================================================================
+
+class CSVParser {
+public:
+    static std::vector<std::string> parseLine(const std::string& line) {
+        std::vector<std::string> result;
+        std::string field;
+        bool inQuotes = false;
+        
+        for (size_t i = 0; i < line.length(); ++i) {
+            char c = line[i];
+            
+            if (c == '"') {
+                if (inQuotes && i + 1 < line.length() && line[i + 1] == '"') {
+                    field += '"';
+                    ++i;
+                } else {
+                    inQuotes = !inQuotes;
+                }
+            } else if (c == ',' && !inQuotes) {
+                result.push_back(field);
+                field.clear();
+            } else {
+                field += c;
+            }
+        }
+        result.push_back(field);
+        return result;
+    }
+    
+    static std::map<std::string, int> parseHeader(const std::string& headerLine) {
+        std::map<std::string, int> headerMap;
+        auto fields = parseLine(headerLine);
+        for (size_t i = 0; i < fields.size(); ++i) {
+            headerMap[fields[i]] = i;
+        }
+        return headerMap;
+    }
+};
+
+// ============================================================================
+// LATIN INSCRIPTION PARSER
+// ============================================================================
+
+class LatinInscriptionParser {
+private:
+    std::map<std::string, std::string> praenomina = {
+        {"A", "AVLVS"}, {"AVLVS", "AVLVS"}, {"AULUS", "AVLVS"},
+        {"C", "GAIVS"}, {"G", "GAIVS"}, {"GAIVS", "GAIVS"}, {"GAIUS", "GAIVS"}, {"CAIVS", "GAIVS"},
+        {"CN", "GNAEVS"}, {"GNAEVS", "GNAEVS"}, {"GNAEUS", "GNAEVS"},
+        {"D", "DECIMVS"}, {"DECIMVS", "DECIMVS"}, {"DECIMUS", "DECIMVS"},
+        {"K", "KAESO"}, {"KAESO", "KAESO"},
+        {"L", "LVCIVS"}, {"LVCIVS", "LVCIVS"}, {"LUCIUS", "LVCIVS"},
+        {"M", "MARCVS"}, {"MARCVS", "MARCVS"}, {"MARCUS", "MARCVS"},
+        {"P", "PVBLIVS"}, {"PVBLIVS", "PVBLIVS"}, {"PUBLIUS", "PVBLIVS"},
+        {"Q", "QVINTVS"}, {"QVINTVS", "QVINTVS"}, {"QUINTUS", "QVINTVS"},
+        {"SEX", "SEXTVS"}, {"SEXTVS", "SEXTVS"}, {"SEXTUS", "SEXTVS"},
+        {"SER", "SERVIVS"}, {"SERVIVS", "SERVIVS"}, {"SERVIUS", "SERVIVS"},
+        {"T", "TITVS"}, {"TITVS", "TITVS"}, {"TITUS", "TITVS"},
+        {"TI", "TIBERIVS"}, {"TIB", "TIBERIVS"}, {"TIBERIVS", "TIBERIVS"}, {"TIBERIUS", "TIBERIVS"},
+        {"APP", "APPIVS"}, {"APPIVS", "APPIVS"}, {"APPIUS", "APPIVS"},
+        {"SP", "SPURIVS"}, {"SPURIVS", "SPURIVS"}, {"SPURIUS", "SPURIVS"}
+    };
+    
+    std::set<std::string> nomina = {
+        "IVLIVS", "JULIUS", "CORNELIVS", "CORNELIUS", "CLAUDIVS", "CLAUDIUS",
+        "FLAVIVS", "FLAVIUS", "VALERIVS", "VALERIUS", "AEMILIVS", "AEMILIUS",
+        "ANTONIVS", "ANTONIUS", "FABIVS", "FABIUS", "SERVILIVS", "SERVILIUS",
+        "POMPEIVS", "POMPEIUS", "SEMPRONIVS", "SEMPRONIUS", "CALPVRNIVS", "CALPURNIUS",
+        "LICINIVS", "LICINIUS", "DOMITIVS", "DOMITIUS", "AVRELIVS", "AURELIUS",
+        "CASSIUS", "CASSIVS", "TERENTIVS", "TERENTIUS",
+        "OCTAVIVS", "OCTAVIUS", "MANLIVS", "MANLIUS", "FVLVIVS", "FULVIUS",
+        "VIBIVS", "VIBIUS", "CAECILIVS", "CAECILIUS", "PORCIUS", "PORCIVS"
+    };
+    
+    std::map<std::string, std::pair<std::string, std::string>> familyRoles = {
+        {"PATER", {"Father", "M"}}, {"PATRI", {"Father", "M"}}, {"PATRIS", {"Father", "M"}},
+        {"MATER", {"Mother", "F"}}, {"MATRI", {"Mother", "F"}}, {"MATRIS", {"Mother", "F"}},
+        {"FILIVS", {"Son", "M"}}, {"FILIO", {"Son", "M"}}, {"FILII", {"Son", "M"}},
+        {"FILIA", {"Daughter", "F"}}, {"FILIAE", {"Daughter", "F"}},
+        {"F", {"Child", "U"}}, {"FIL", {"Child", "U"}},
+        {"VXOR", {"Wife", "F"}}, {"VXORI", {"Wife", "F"}}, {"VXORIS", {"Wife", "F"}},
+        {"CONIVX", {"Spouse", "U"}}, {"CONIVGI", {"Spouse", "U"}},
+        {"MARITUS", {"Husband", "M"}}, {"MARITO", {"Husband", "M"}},
+        {"FRATER", {"Brother", "M"}}, {"FRATRI", {"Brother", "M"}},
+        {"SOROR", {"Sister", "F"}}, {"SORORI", {"Sister", "F"}},
+        {"LIBERTUS", {"Freedman", "M"}}, {"LIBERTO", {"Freedman", "M"}},
+        {"LIBERTA", {"Freedwoman", "F"}}, {"LIBERTAE", {"Freedwoman", "F"}},
+        {"LIB", {"Freedperson", "U"}},
+        {"AVUS", {"Grandfather", "M"}}, {"AVO", {"Grandfather", "M"}},
+        {"AVIA", {"Grandmother", "F"}}, {"AVIAE", {"Grandmother", "F"}},
+        {"NEPOS", {"Grandson", "M"}}, {"NEPOTI", {"Grandson", "M"}},
+        {"NEPTIS", {"Granddaughter", "F"}}, {"NEPTI", {"Granddaughter", "F"}},
+        {"AMICUS", {"Friend", "M"}}, {"AMICO", {"Friend", "M"}},
+        {"AMICA", {"Friend", "F"}}, {"AMICAE", {"Friend", "F"}},
+        {"HERES", {"Heir", "U"}}, {"HEREDI", {"Heir", "U"}}, {"H", {"Heir", "U"}}
+    };
+    
+    std::map<std::string, std::string> ageAbbreviations = {
+        {"AN", "years"}, {"ANN", "years"}, {"ANNOR", "years"}, 
+        {"ANNORVM", "years"}, {"ANNO", "years"}, {"ANNIS", "years"}, {"A", "years"},
+        {"M", "months"}, {"MENS", "months"}, {"MENSIBVS", "months"},
+        {"MEN", "months"}, {"MENSIS", "months"},
+        {"D", "days"}, {"DIEBVS", "days"}, {"DIE", "days"},
+        {"DIER", "days"}, {"DIERVM", "days"},
+        {"H", "hours"}
+    };
+    
+    std::set<std::string> tribes = {
+        "FAB", "FABIA", "COR", "CORNELIA", "PAL", "PALATINA",
+        "VEL", "VELINA", "VOL", "VOLTINIA", "TRO", "TROMENTINA",
+        "SCA", "SCAPTIA", "ANI", "ANIENSIS", "AEM", "AEMILIA",
+        "CLV", "CLUSTVMINA", "GAL", "GALERIA", "LEM", "LEMONIA",
+        "MAE", "MAECIA", "OVF", "OFENTINA", "POL", "POLLIA",
+        "POM", "POMPTINA", "PVP", "PVPINIA", "QVI", "QVIRINA",
+        "SER", "SERGIA", "STE", "STELLATINA", "SVB", "SVBVRANA",
+        "TER", "TERETINA", "ARN", "ARNENSIS", "CAM", "CAMILIA"
+    };
+    
+    std::string normalize(const std::string& text) {
+        std::string result = text;
+        std::transform(result.begin(), result.end(), result.begin(), ::toupper);
+        std::replace(result.begin(), result.end(), 'U', 'V');
+        std::replace(result.begin(), result.end(), 'J', 'I');
+        return result;
+    }
+    
+    std::vector<std::string> tokenize(const std::string& text) {
+        std::vector<std::string> tokens;
+        std::string normalized = normalize(text);
+        
+        std::regex prefixRegex("^(D\\s*M|DIS\\s+MANIBVS|H\\s*S\\s*E|D\\s*M\\s*S)");
+        normalized = std::regex_replace(normalized, prefixRegex, "");
+        
+        std::istringstream stream(normalized);
+        std::string token;
+        
+        while (stream >> token) {
+            std::string cleaned;
+            for (char c : token) {
+                if (std::isalnum(c) || c == '.' || c == '(' || c == ')' || c == '[' || c == ']') {
+                    cleaned += c;
+                }
+            }
+            if (!cleaned.empty() && cleaned != "." && cleaned != "..") {
+                tokens.push_back(cleaned);
+            }
+        }
+        return tokens;
+    }
+    
+    int parseRomanNumeral(const std::string& roman) {
+        std::map<char, int> romanValues = {
+            {'I', 1}, {'V', 5}, {'X', 10}, {'L', 50},
+            {'C', 100}, {'D', 500}, {'M', 1000}
+        };
+        
+        try {
+            return std::stoi(roman);
+        } catch (...) {}
+        
+        int result = 0;
+        int prevValue = 0;
+        
+        for (int i = roman.length() - 1; i >= 0; --i) {
+            auto it = romanValues.find(roman[i]);
+            if (it == romanValues.end()) {
+                return -1;
+            }
+            
+            int value = it->second;
+            if (value < prevValue) {
+                result -= value;
+            } else {
+                result += value;
+            }
+            prevValue = value;
+        }
+        return result;
+    }
+    
+    bool isPraenomenAbbrev(const std::string& token) {
+        return praenomina.find(token) != praenomina.end();
+    }
+    
+    bool isNomen(const std::string& token) {
+        return nomina.find(token) != nomina.end();
+    }
+    
+    bool isTribe(const std::string& token) {
+        return tribes.find(token) != tribes.end();
+    }
+
+public:
+    std::vector<Person> parse(const std::string& inscription, const std::string& inscriptionId = "") {
+        std::vector<Person> people;
+        std::vector<std::string> tokens = tokenize(inscription);
+        
+        if (tokens.empty()) return people;
+        
+        size_t i = 0;
+        while (i < tokens.size()) {
+            Person person;
+            person.inscriptionId = inscriptionId;
+            person.rawTokens = tokens;
+            
+            if (isPraenomenAbbrev(tokens[i])) {
+                person.praenomen = praenomina[tokens[i]];
+                std::string nameBuilder = tokens[i];
+                i++;
+                
+                if (i < tokens.size() && isNomen(tokens[i])) {
+                    person.nomen = tokens[i];
+                    nameBuilder += " " + tokens[i];
+                    i++;
+                    
+                    if (i < tokens.size() && 
+                        familyRoles.find(tokens[i]) == familyRoles.end() &&
+                        ageAbbreviations.find(tokens[i]) == ageAbbreviations.end() &&
+                        !isTribe(tokens[i])) {
+                        person.cognomen = tokens[i];
+                        nameBuilder += " " + tokens[i];
+                        i++;
+                    }
+                }
+                person.name = nameBuilder;
+            } else if (isNomen(tokens[i])) {
+                person.nomen = tokens[i];
+                person.name = tokens[i];
+                i++;
+                
+                if (i < tokens.size() && 
+                    familyRoles.find(tokens[i]) == familyRoles.end() &&
+                    ageAbbreviations.find(tokens[i]) == ageAbbreviations.end()) {
+                    person.cognomen = tokens[i];
+                    person.name += " " + tokens[i];
+                    i++;
+                }
+            } else if (familyRoles.find(tokens[i]) != familyRoles.end()) {
+                auto roleInfo = familyRoles[tokens[i]];
+                person.familyRole = roleInfo.first;
+                person.gender = roleInfo.second;
+                i++;
+            } else {
+                std::string nameBuilder;
+                int wordCount = 0;
+                while (i < tokens.size() && wordCount < 3 &&
+                       familyRoles.find(tokens[i]) == familyRoles.end() &&
+                       ageAbbreviations.find(tokens[i]) == ageAbbreviations.end() &&
+                       tokens[i] != "VIXIT" && tokens[i] != "VIX" &&
+                       tokens[i] != "FECIT" && tokens[i] != "FEC") {
+                    if (!nameBuilder.empty()) nameBuilder += " ";
+                    nameBuilder += tokens[i];
+                    i++;
+                    wordCount++;
+                }
+                if (!nameBuilder.empty()) {
+                    person.name = nameBuilder;
+                }
+            }
+            
+            while (i < tokens.size() && isTribe(tokens[i])) {
+                person.tribe = tokens[i];
+                i++;
+            }
+            
+            while (i < tokens.size() && familyRoles.find(tokens[i]) != familyRoles.end()) {
+                auto roleInfo = familyRoles[tokens[i]];
+                person.familyRole = roleInfo.first;
+                if (person.gender.empty()) {
+                    person.gender = roleInfo.second;
+                }
+                
+                if (tokens[i].find("LIBERT") != std::string::npos) {
+                    person.status = "Freed";
+                }
+                i++;
+            }
+            
+            while (i < tokens.size()) {
+                if (tokens[i] == "VIXIT" || tokens[i] == "VIX" || 
+                    (tokens[i] == "V" && i + 1 < tokens.size())) {
+                    i++;
+                    continue;
+                }
+                
+                auto ageIt = ageAbbreviations.find(tokens[i]);
+                if (ageIt != ageAbbreviations.end()) {
+                    person.ageUnit = ageIt->second;
+                    
+                    if (i + 1 < tokens.size()) {
+                        int ageVal = parseRomanNumeral(tokens[i + 1]);
+                        if (ageVal != -1) {
+                            person.age = ageVal;
+                            i += 2;
+                            break;
+                        }
+                    }
+                    if (i > 0 && person.age == -1) {
+                        int ageVal = parseRomanNumeral(tokens[i - 1]);
+                        if (ageVal != -1) {
+                            person.age = ageVal;
+                        }
+                    }
+                    i++;
+                    break;
+                }
+                i++;
+            }
+            
+            if (person.status.empty()) {
+                if (!person.familyRole.empty() && 
+                    person.familyRole.find("Freed") != std::string::npos) {
+                    person.status = "Freed";
+                } else if (!person.nomen.empty()) {
+                    person.status = "Free";
+                }
+            }
+            
+            if (!person.name.empty() || !person.familyRole.empty() || person.age != -1) {
+                people.push_back(person);
+            }
+            
+            if (i < tokens.size() && (tokens[i] == "ET" || tokens[i] == "ITEM")) {
+                i++;
+            }
+        }
+        
+        return people;
+    }
+};
+
+// ============================================================================
+// VISUALIZATION TOOLS
+// ============================================================================
+
+class DataVisualization {
+public:
+    static void generateAgeHistogram(const std::vector<Person>& people, 
+                                     const std::string& filename) {
+        std::map<int, int> ageGroups;
+        
+        for (const auto& person : people) {
+            if (person.age > 0 && person.age < 120 && person.ageUnit == "years") {
+                int group = (person.age / 10) * 10;
+                ageGroups[group]++;
+            }
+        }
+        
+        std::ofstream file(filename);
+        if (!file.is_open()) return;
+        
+        file << "Age Group,Count\n";
+        for (const auto& pair : ageGroups) {
+            file << pair.first << "-" << (pair.first + 9) << "," << pair.second << "\n";
+        }
+        file.close();
+        
+        std::cout << "\nAge distribution saved to " << filename << "\n";
+        printASCIIHistogram(ageGroups, "AGE DISTRIBUTION");
+    }
+    
+    static void generateGenderDistribution(const std::vector<Person>& people,
+                                           const std::string& filename) {
+        std::map<std::string, int> genderCount;
+        
+        for (const auto& person : people) {
+            if (!person.gender.empty()) {
+                std::string gender = person.gender == "M" ? "Male" :
+                                    person.gender == "F" ? "Female" : "Unknown";
+                genderCount[gender]++;
+            }
+        }
+        
+        std::ofstream file(filename);
+        if (!file.is_open()) return;
+        
+        file << "Gender,Count\n";
+        for (const auto& pair : genderCount) {
+            file << pair.first << "," << pair.second << "\n";
+        }
+        file.close();
+        
+        std::cout << "Gender distribution saved to " << filename << "\n";
+        printASCIIPieChart(genderCount, "GENDER DISTRIBUTION");
+    }
+    
+    static void generateProvinceMap(const std::vector<InscriptionRecord>& inscriptions,
+                                    const std::string& filename) {
+        std::map<std::string, int> provinceCount;
+        
+        for (const auto& inscription : inscriptions) {
+            if (!inscription.province.empty()) {
+                provinceCount[inscription.province]++;
+            }
+        }
+        
+        std::ofstream file(filename);
+        if (!file.is_open()) return;
+        
+        file << "Province,Count\n";
+        for (const auto& pair : provinceCount) {
+            file << "\"" << pair.first << "\"," << pair.second << "\n";
+        }
+        file.close();
+        
+        std::cout << "Province distribution saved to " << filename << "\n";
+        
+        std::vector<std::pair<std::string, int>> sorted(provinceCount.begin(), provinceCount.end());
+        std::sort(sorted.begin(), sorted.end(),
+                 [](const auto& a, const auto& b) { return a.second > b.second; });
+        
+        std::map<std::string, int> top10;
+        for (size_t i = 0; i < std::min(size_t(10), sorted.size()); ++i) {
+            top10[sorted[i].first] = sorted[i].second;
+        }
+        printASCIIHistogram(top10, "TOP 10 PROVINCES");
+    }
+    
+private:
+    static void printASCIIHistogram(const std::map<int, int>& data, const std::string& title) {
+        if (data.empty()) return;
+        
+        int maxCount = 0;
+        for (const auto& pair : data) {
+            maxCount = std::max(maxCount, pair.second);
+        }
+        
+        std::cout << "\n" << title << "\n";
+        std::cout << std::string(50, '=') << "\n";
+        
+        for (const auto& pair : data) {
+            int barLength = (pair.second * 40) / maxCount;
+            std::cout << std::setw(8) << pair.first << " | ";
+            std::cout << std::string(barLength, '#');
+            std::cout << " " << pair.second << "\n";
+        }
+        std::cout << "\n";
+    }
+    
+    static void printASCIIHistogram(const std::map<std::string, int>& data, 
+                                    const std::string& title) {
+        if (data.empty()) return;
+        
+        int maxCount = 0;
+        for (const auto& pair : data) {
+            maxCount = std::max(maxCount, pair.second);
+        }
+        
+        std::cout << "\n" << title << "\n";
+        std::cout << std::string(60, '=') << "\n";
+        
+        for (const auto& pair : data) {
+            int barLength = (pair.second * 30) / maxCount;
+            std::cout << std::setw(20) << pair.first.substr(0, 20) << " | ";
+            std::cout << std::string(barLength, '#');
+            std::cout << " " << pair.second << "\n";
+        }
+        std::cout << "\n";
+    }
+    
+    static void printASCIIPieChart(const std::map<std::string, int>& data,
+                                   const std::string& title) {
+        if (data.empty()) return;
+        
+        int total = 0;
+        for (const auto& pair : data) {
+            total += pair.second;
+        }
+        
+        std::cout << "\n" << title << "\n";
+        std::cout << std::string(50, '=') << "\n";
+        
+        for (const auto& pair : data) {
+            double percentage = (pair.second * 100.0) / total;
+            int barLength = static_cast<int>(percentage / 2);
+            
+            std::cout << std::setw(15) << pair.first << " | ";
+            std::cout << std::string(barLength, '=');
+            std::cout << " " << std::fixed << std::setprecision(1) 
+                     << percentage << "% (" << pair.second << ")\n";
+        }
+        std::cout << "\n";
+    }
+};
+
+// ============================================================================
+// MAIN DATABASE CLASS
+// ============================================================================
+
+class InscriptionDatabase {
+private:
+    std::vector<InscriptionRecord> inscriptions;
+    std::vector<Person> allPeople;
+    LatinInscriptionParser parser;
+    std::map<std::string, int> columnMapping;
+    FamilyNetwork network;
+    
+    void parseInscriptionForPeople(const InscriptionRecord& record) {
+        std::string textToParse = record.clean_text_interpretive;
+        if (textToParse.empty()) {
+            textToParse = record.clean_text_conservative;
+        }
+        if (textToParse.empty()) {
+            textToParse = record.inscription_text;
+        }
+        
+        auto people = parser.parse(textToParse, record.id);
+        
+        if (people.size() > 1) {
+            for (size_t i = 0; i < people.size(); ++i) {
+                for (size_t j = i + 1; j < people.size(); ++j) {
+                    if (!people[i].name.empty() && !people[j].name.empty()) {
+                        std::string rel = people[i].familyRole.empty() ? 
+                                        "related" : people[i].familyRole;
+                        network.addRelationship(people[i].name, people[j].name, rel);
+                    }
+                }
+            }
+        }
+        
+        for (auto& person : people) {
+            person.inscriptionId = record.id;
+            allPeople.push_back(person);
+        }
+    }
+    
+public:
+    bool loadFromCSV(const std::string& filename) {
+        std::ifstream file(filename);
+        if (!file.is_open()) {
+            std::cerr << "Error: Could not open file " << filename << std::endl;
+            return false;
+        }
+        
+        std::string line;
+        if (!std::getline(file, line)) {
+            std::cerr << "Error: Empty file" << std::endl;
+            return false;
+        }
+        
+        columnMapping = CSVParser::parseHeader(line);
+        
+        int recordCount = 0;
+        while (std::getline(file, line)) {
+            if (line.empty()) continue;
+            
+            auto fields = CSVParser::parseLine(line);
+            InscriptionRecord record;
+            
+            auto getField = [&](const std::string& fieldName) -> std::string {
+                auto it = columnMapping.find(fieldName);
+                if (it != columnMapping.end() && it->second < fields.size()) {
+                    return fields[it->second];
+                }
+                return "";
+            };
+            
+            record.id = getField("id");
+            if (record.id.empty()) record.id = getField("hd_nr");
+            if (record.id.empty()) record.id = getField("inscription_id");
+            
+            record.inscription_text = getField("inscription_text");
+            if (record.inscription_text.empty()) {
+                record.inscription_text = getField("transcription");
+            }
+            
+            record.clean_text_conservative = getField("clean_text_conservative");
+            record.clean_text_interpretive = getField("clean_text_interpretive");
+            record.not_after = getField("not_after");
+            record.not_before = getField("not_before");
+            record.findspot = getField("findspot_ancient");
+            if (record.findspot.empty()) record.findspot = getField("findspot");
+            record.province = getField("province_label");
+            if (record.province.empty()) record.province = getField("province");
+            record.material = getField("material");
+            record.type_of_inscription = getField("type_of_inscription");
+            record.language = getField("language");
+            record.height = getField("height_cm");
+            record.width = getField("width_cm");
+            record.depth = getField("depth_cm");
+            record.latitude = getField("latitude");
+            record.longitude = getField("longitude");
+            record.commentary = getField("commentary");
+            record.bibliography = getField("bibliography");
+            
+            inscriptions.push_back(record);
+            parseInscriptionForPeople(record);
+            
+            recordCount++;
+            if (recordCount % 1000 == 0) {
+                std::cout << "Loaded " << recordCount << " inscriptions..." << std::endl;
+            }
+        }
+        
+        file.close();
+        std::cout << "\nSuccessfully loaded " << inscriptions.size() << " inscriptions" << std::endl;
+        std::cout << "Extracted " << allPeople.size() << " person records" << std::endl;
+        return true;
+    }
+    
+    void printStatistics() {
+        std::cout << "\n=== DATABASE STATISTICS ===\n";
+        std::cout << "Total inscriptions: " << inscriptions.size() << "\n";
+        std::cout << "Total people extracted: " << allPeople.size() << "\n";
+        
+        std::map<std::string, int> roleCount;
+        std::map<std::string, int> genderCount;
+        std::map<std::string, int> statusCount;
+        std::vector<int> ages;
+        
+        for (const auto& person : allPeople) {
+            if (!person.familyRole.empty()) {
+                roleCount[person.familyRole]++;
+            }
+            if (!person.gender.empty()) {
+                genderCount[person.gender]++;
+            }
+            if (!person.status.empty()) {
+                statusCount[person.status]++;
+            }
+            if (person.age > 0 && person.age < 150 && person.ageUnit == "years") {
+                ages.push_back(person.age);
+            }
+        }
+        
+        std::cout << "\nFamily Roles:\n";
+        for (const auto& pair : roleCount) {
+            std::cout << "  " << std::setw(20) << std::left << pair.first 
+                     << ": " << pair.second << "\n";
+        }
+        
+        std::cout << "\nGender Distribution:\n";
+        for (const auto& pair : genderCount) {
+            std::string gender = pair.first == "M" ? "Male" : 
+                                pair.first == "F" ? "Female" : "Unknown";
+            std::cout << "  " << std::setw(20) << std::left << gender 
+                     << ": " << pair.second << "\n";
+        }
+        
+        std::cout << "\nStatus Distribution:\n";
+        for (const auto& pair : statusCount) {
+            std::cout << "  " << std::setw(20) << std::left << pair.first 
+                     << ": " << pair.second << "\n";
+        }
+        
+        if (!ages.empty()) {
+            std::sort(ages.begin(), ages.end());
+            double sum = 0;
+            for (int age : ages) sum += age;
+            double mean = sum / ages.size();
+            double median = ages[ages.size() / 2];
+            
+            std::cout << "\nAge Statistics (n=" << ages.size() << "):\n";
+            std::cout << "  Mean: " << std::fixed << std::setprecision(1) << mean << " years\n";
+            std::cout << "  Median: " << median << " years\n";
+            std::cout << "  Range: " << ages.front() << " - " << ages.back() << " years\n";
+        }
+        
+        std::map<std::string, int> provinceCount;
+        for (const auto& inscription : inscriptions) {
+            if (!inscription.province.empty()) {
+                provinceCount[inscription.province]++;
+            }
+        }
+        
+        std::cout << "\nTop 10 Provinces:\n";
+        std::vector<std::pair<std::string, int>> sortedProvinces(
+            provinceCount.begin(), provinceCount.end());
+        std::sort(sortedProvinces.begin(), sortedProvinces.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+        
+        for (size_t i = 0; i < std::min(size_t(10), sortedProvinces.size()); ++i) {
+            std::string provName = sortedProvinces[i].first;
+            if (provName.length() > 25) provName = provName.substr(0, 22) + "...";
+            std::cout << "  " << std::setw(28) << std::left << provName 
+                     << ": " << sortedProvinces[i].second << "\n";
+        }
+    }
+    
+    std::vector<Person> searchByName(const std::string& name) const {
+        std::vector<Person> results;
+        std::string searchName = name;
+        std::transform(searchName.begin(), searchName.end(), 
+                      searchName.begin(), ::toupper);
+        
+        for (const auto& person : allPeople) {
+            if (person.name.find(searchName) != std::string::npos ||
+                person.praenomen.find(searchName) != std::string::npos ||
+                person.nomen.find(searchName) != std::string::npos ||
+                person.cognomen.find(searchName) != std::string::npos) {
+                results.push_back(person);
+            }
+        }
+        return results;
+    }
+    
+    std::vector<Person> searchByRole(const std::string& role) const {
+        std::vector<Person> results;
+        for (const auto& person : allPeople) {
+            if (person.familyRole.find(role) != std::string::npos) {
+                results.push_back(person);
+            }
+        }
+        return results;
+    }
+    
+    std::vector<Person> searchByAgeRange(int minAge, int maxAge) const {
+        std::vector<Person> results;
+        for (const auto& person : allPeople) {
+            if (person.age >= minAge && person.age <= maxAge) {
+                results.push_back(person);
+            }
+        }
+        return results;
+    }
+    
+    std::vector<InscriptionRecord> searchByProvince(const std::string& province) const {
+        std::vector<InscriptionRecord> results;
+        std::string searchProv = province;
+        std::transform(searchProv.begin(), searchProv.end(), 
+                      searchProv.begin(), ::toupper);
+        
+        for (const auto& inscription : inscriptions) {
+            std::string inscProv = inscription.province;
+            std::transform(inscProv.begin(), inscProv.end(), 
+                          inscProv.begin(), ::toupper);
+            if (inscProv.find(searchProv) != std::string::npos) {
+                results.push_back(inscription);
+            }
+        }
+        return results;
+    }
+    
+    std::vector<InscriptionRecord> searchByDateRange(int minYear, int maxYear) const {
+        std::vector<InscriptionRecord> results;
+        for (const auto& inscription : inscriptions) {
+            try {
+                if (!inscription.not_before.empty() && !inscription.not_after.empty()) {
+                    int notBefore = std::stoi(inscription.not_before);
+                    int notAfter = std::stoi(inscription.not_after);
+                    
+                    if ((notBefore >= minYear && notBefore <= maxYear) ||
+                        (notAfter >= minYear && notAfter <= maxYear) ||
+                        (notBefore <= minYear && notAfter >= maxYear)) {
+                        results.push_back(inscription);
+                    }
+                }
+            } catch (...) {}
+        }
+        return results;
+    }
+    
+    void exportPeopleToCSV(const std::string& filename) const {
+        std::ofstream file(filename);
+        if (!file.is_open()) {
+            std::cerr << "Error: Could not create file " << filename << std::endl;
+            return;
+        }
+        
+        file << "inscription_id,name,praenomen,nomen,cognomen,age,age_unit,"
+             << "family_role,gender,status,tribe\n";
+        
+        for (const auto& person : allPeople) {
+            file << person.toCSV() << "\n";
+        }
+        
+        file.close();
+        std::cout << "Exported " << allPeople.size() << " people to " << filename << std::endl;
+    }
+    
+    void generateVisualizations(const std::string& outputDir) {
+        std::cout << "\nGenerating visualizations...\n";
+        DataVisualization::generateAgeHistogram(allPeople, outputDir + "/age_distribution.csv");
+        DataVisualization::generateGenderDistribution(allPeople, outputDir + "/gender_distribution.csv");
+        DataVisualization::generateProvinceMap(inscriptions, outputDir + "/province_distribution.csv");
+        network.exportToDOT(outputDir + "/family_network.dot");
+        std::cout << "Visualizations saved to " << outputDir << "/\n";
+    }
+    
+    const std::vector<InscriptionRecord>& getInscriptions() const {
+        return inscriptions;
+    }
+    
+    const std::vector<Person>& getAllPeople() const {
+        return allPeople;
+    }
+};
+
+// ============================================================================
+// MENU AND MAIN
+// ============================================================================
+
+void printMenu() {
+    std::cout << "\n=== LATIN INSCRIPTION DATABASE ===\n";
+    std::cout << " 1. Load inscriptions from CSV\n";
+    std::cout << " 2. Show statistics\n";
+    std::cout << " 3. Search by name\n";
+    std::cout << " 4. Search by family role\n";
+    std::cout << " 5. Search by age range\n";
+    std::cout << " 6. Search by province\n";
+    std::cout << " 7. Search by date range\n";
+    std::cout << " 8. Export people to CSV\n";
+    std::cout << " 9. Generate visualizations\n";
+    std::cout << "10. Show sample inscriptions\n";
+    std::cout << " 0. Exit\n";
+    std::cout << "Choice: ";
+}
+
+int main(int argc, char* argv[]) {
+    InscriptionDatabase db;
+    
+    std::cout << "\n=== Latin Inscription Database - EDH Parser ===\n\n";
+    
+    if (argc > 1) {
+        std::cout << "Loading file: " << argv[1] << std::endl;
+        if (db.loadFromCSV(argv[1])) {
+            db.printStatistics();
+        }
+    }
+    
+    while (true) {
+        printMenu();
+        
+        int choice;
+        std::cin >> choice;
+        std::cin.ignore();
+        
+        switch (choice) {
+            case 1: {
+                std::cout << "Enter CSV filename: ";
+                std::string filename;
+                std::getline(std::cin, filename);
+                if (db.loadFromCSV(filename)) {
+                    db.printStatistics();
+                }
+                break;
+            }
+            
+            case 2:
+                db.printStatistics();
+                break;
+            
+            case 3: {
+                std::cout << "Enter name to search: ";
+                std::string name;
+                std::getline(std::cin, name);
+                auto results = db.searchByName(name);
+                std::cout << "\nFound " << results.size() << " people:\n";
+                for (size_t i = 0; i < std::min(size_t(20), results.size()); ++i) {
+                    std::cout << "\n[" << (i+1) << "]\n";
+                    results[i].print();
+                }
+                if (results.size() > 20) {
+                    std::cout << "... and " << (results.size() - 20) << " more\n";
+                }
+                break;
+            }
+            
+            case 4: {
+                std::cout << "Enter family role (Father/Mother/Son/Daughter/Wife/Husband/etc.): ";
+                std::string role;
+                std::getline(std::cin, role);
+                auto results = db.searchByRole(role);
+                std::cout << "\nFound " << results.size() << " people with role '" << role << "':\n";
+                for (size_t i = 0; i < std::min(size_t(20), results.size()); ++i) {
+                    std::cout << "\n[" << (i+1) << "]\n";
+                    results[i].print();
+                }
+                if (results.size() > 20) {
+                    std::cout << "... and " << (results.size() - 20) << " more\n";
+                }
+                break;
+            }
+            
+            case 5: {
+                std::cout << "Enter minimum age: ";
+                int minAge;
+                std::cin >> minAge;
+                std::cout << "Enter maximum age: ";
+                int maxAge;
+                std::cin >> maxAge;
+                std::cin.ignore();
+                
+                auto results = db.searchByAgeRange(minAge, maxAge);
+                std::cout << "\nFound " << results.size() << " people aged " 
+                         << minAge << "-" << maxAge << ":\n";
+                for (size_t i = 0; i < std::min(size_t(20), results.size()); ++i) {
+                    std::cout << "\n[" << (i+1) << "]\n";
+                    results[i].print();
+                }
+                if (results.size() > 20) {
+                    std::cout << "... and " << (results.size() - 20) << " more\n";
+                }
+                break;
+            }
+            
+            case 6: {
+                std::cout << "Enter province name: ";
+                std::string province;
+                std::getline(std::cin, province);
+                auto results = db.searchByProvince(province);
+                std::cout << "\nFound " << results.size() << " inscriptions from " << province << "\n";
+                for (size_t i = 0; i < std::min(size_t(5), results.size()); ++i) {
+                    std::cout << "\n[" << (i+1) << "]\n";
+                    std::cout << "ID: " << results[i].id << "\n";
+                    std::cout << "Province: " << results[i].province << "\n";
+                    std::cout << "Findspot: " << results[i].findspot << "\n";
+                    std::string text = results[i].inscription_text;
+                    if (text.length() > 150) text = text.substr(0, 147) + "...";
+                    std::cout << "Text: " << text << "\n";
+                }
+                break;
+            }
+            
+            case 7: {
+                std::cout << "Enter start year (e.g., -100 for 100 BCE, 100 for 100 CE): ";
+                int minYear;
+                std::cin >> minYear;
+                std::cout << "Enter end year: ";
+                int maxYear;
+                std::cin >> maxYear;
+                std::cin.ignore();
+                
+                auto results = db.searchByDateRange(minYear, maxYear);
+                std::cout << "\nFound " << results.size() << " inscriptions from " 
+                         << minYear << " to " << maxYear << "\n";
+                for (size_t i = 0; i < std::min(size_t(5), results.size()); ++i) {
+                    std::cout << "\n[" << (i+1) << "]\n";
+                    std::cout << "ID: " << results[i].id << "\n";
+                    std::cout << "Date range: " << results[i].not_before 
+                             << " to " << results[i].not_after << "\n";
+                    std::string text = results[i].inscription_text;
+                    if (text.length() > 150) text = text.substr(0, 147) + "...";
+                    std::cout << "Text: " << text << "\n";
+                }
+                break;
+            }
+            
+            case 8: {
+                std::cout << "Enter output filename (default: people_export.csv): ";
+                std::string filename;
+                std::getline(std::cin, filename);
+                if (filename.empty()) filename = "people_export.csv";
+                db.exportPeopleToCSV(filename);
+                break;
+            }
+            
+            case 9: {
+                std::cout << "Enter output directory (default: output): ";
+                std::string dir;
+                std::getline(std::cin, dir);
+                if (dir.empty()) dir = "output";
+                db.generateVisualizations(dir);
+                break;
+            }
+            
+            case 10: {
+                const auto& inscriptions = db.getInscriptions();
+                std::cout << "\nShowing first 5 inscriptions:\n";
+                for (size_t i = 0; i < std::min(size_t(5), inscriptions.size()); ++i) {
+                    std::cout << "\n=== Inscription " << (i+1) << " ===\n";
+                    std::cout << "ID: " << inscriptions[i].id << "\n";
+                    std::cout << "Province: " << inscriptions[i].province << "\n";
+                    std::cout << "Findspot: " << inscriptions[i].findspot << "\n";
+                    std::cout << "Date: " << inscriptions[i].not_before 
+                             << " to " << inscriptions[i].not_after << "\n";
+                    std::cout << "Text:\n" << inscriptions[i].inscription_text << "\n";
+                }
+                break;
+            }
+            
+            case 0:
+                std::cout << "\nThank you for using Latin Inscription Database!\n";
+                return 0;
+            
+            default:
+                std::cout << "Invalid choice. Please try again.\n";
+        }
+        
+        std::cout << "\nPress Enter to continue...";
+        std::cin.get();
+    }
+    
+    return 0;
+}
